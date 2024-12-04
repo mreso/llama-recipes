@@ -9,13 +9,21 @@ class Params4bit(torch.nn.Parameter):
     def __new__(
         cls,
         data,
+        dtype,
         requires_grad = False,
         bnb_quantized = False,
         ):
         if data is None:
             data = torch.empty(0)
+        self =  torch.Tensor._make_wrapper_subclass(cls, data.size(), dtype=dtype, requires_grad=requires_grad)
 
-        self = torch.Tensor._make_subclass(cls, data, requires_grad)
+    def __init__(
+        self,
+        data,
+        dtype,
+        requires_grad = False,
+        bnb_quantized = False,
+        ):
         self._data = data
         self.bnb_quantized = bnb_quantized
 
@@ -47,11 +55,28 @@ class Params4bit(torch.nn.Parameter):
             return self._quantize(device)
         else:
             new_param = Params4bit(
-                super().to(device=device, dtype=dtype, non_blocking=non_blocking),
+                self._data.to(device=device, dtype=dtype, non_blocking=non_blocking),
+                dtype,
                 requires_grad=self.requires_grad,
             )
 
             return new_param
+
+    @classmethod
+    def __torch_dispatch__(cls, func, types, args=(), kwargs=None):
+        def unwrap(t):
+            if isinstance(t, cls):
+                return t._data
+            else:
+                return t
+
+        def wrap(t):
+            if isinstance(t, Tensor) and not isinstance(t, cls):
+                return cls(t)
+            else:
+                return t
+
+        return tree_map(wrap, func(*tree_map(unwrap, args), **tree_map(unwrap, kwargs)))
     
 
 class Linear4bit(torch.nn.Linear):
@@ -66,6 +91,7 @@ class Linear4bit(torch.nn.Linear):
         super().__init__(input_features, output_features, bias, device)
         self.weight = Params4bit(
             self.weight.data,
+            self.weight.data.dtype,
             requires_grad=False,
         )
 
@@ -74,17 +100,4 @@ from accelerate.big_modeling import init_on_device
 with init_on_device("meta"):
     m = Linear4bit(16, 1)
 
-
-
-
-# #emulate File "/home/mreso/.conda/envs/llama/lib/python3.10/site-packages/accelerate/big_modeling.py", line 132, in register_empty_parameter
-# param = 
-# param_cls = type(m._parameters["weight"])
-# kwargs = m._parameters["weights"].__dict__
-# kwargs["requires_grad"] = param.requires_grad
-# module._parameters[name] = param_cls(module._parameters[name].to(device), **kwargs)
-
-
-
-
-# m = m.to("cuda")
+m.to_empty(device="cuda")
