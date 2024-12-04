@@ -11,7 +11,6 @@ from typing import Optional, Dict, Any, Union, overload, TypeVar
 T = TypeVar("T", bound="torch.nn.Module")
 
 class Params4bit(torch.nn.Parameter):
-    foo = "bar"
     def __new__(
         cls,
         data: Optional[torch.Tensor] = None,
@@ -28,16 +27,29 @@ class Params4bit(torch.nn.Parameter):
         if data is None:
             data = torch.empty(0)
 
-        self = torch.Tensor._make_subclass(cls, data, requires_grad)
+        self = torch.Tensor._make_wrapper_subclass(cls, data.size(), dtype=quant_storage, requires_grad=requires_grad)
+        return self
+
+    def __init__(
+        self,
+        data: Optional[torch.Tensor] = None,
+        requires_grad=False,  # quantized weights should be frozen by default
+        quant_state: Optional[QuantState] = None,
+        blocksize: int = 64,
+        compress_statistics: bool = True,
+        quant_type: str = "fp4",
+        quant_storage: torch.dtype = torch.uint8,
+        module: Optional["Linear4bit"] = None,
+        bnb_quantized: bool = False,
+    ) -> "Params4bit":
         self.blocksize = blocksize
         self.compress_statistics = compress_statistics
         self.quant_type = quant_type
         self.quant_state = quant_state
         self.quant_storage = quant_storage
         self.bnb_quantized = bnb_quantized
-        self._data = data if _data is None else _data
+        self._data = data
         self.module = module
-        return self
 
     def __getstate__(self):
         state = self.__dict__.copy()
@@ -80,16 +92,18 @@ class Params4bit(torch.nn.Parameter):
         module: Optional["Linear4bit"] = None,
         **kwargs,
     ) -> "Params4bit":
-        self = torch.Tensor._make_subclass(cls, data.to(device))
-        self.requires_grad = requires_grad
-        self.quant_state = QuantState.from_dict(qs_dict=quantized_stats, device=device)
-        self.blocksize = self.quant_state.blocksize
-        self.compress_statistics = self.quant_state.nested
-        self.quant_type = self.quant_state.quant_type
-        self.bnb_quantized = True
-
-        self.quant_storage = data.dtype
-        self.module = module
+        quant_state = QuantState.from_dict(qs_dict=quantized_stats, device=device)
+        self = Params4bit(
+            data,
+            requires_grad = requires_grad,
+            quant_state = quant_state,
+            blocksize = quant_state.blocksize,
+            compress_statistics = quant_state.nested,
+            quant_type = quant_state.quant_type,
+            bnb_quantized = True,
+            quant_storage = data.dtype,
+            module = module,
+        )
 
         if self.module is not None:
             self.module.quant_state = self.quant_state
@@ -139,11 +153,12 @@ class Params4bit(torch.nn.Parameter):
         # elif device is not None and device.type == "meta":
         #     return self._data
         else:
+            print(f"{self=}")
             if self.quant_state is not None:
                 self.quant_state.to(device)
 
             new_param = Params4bit(
-                super().to(device=device, dtype=dtype, non_blocking=non_blocking),
+                self._data.to(device=device, dtype=dtype, non_blocking=non_blocking),
                 requires_grad=self.requires_grad,
                 quant_state=self.quant_state,
                 blocksize=self.blocksize,
@@ -250,36 +265,36 @@ def params4bit_chunk(aten_op, *args, **kwargs):
 
 #         return tree_map(wrap, func(*tree_map(unwrap, args), **tree_map(unwrap, kwargs)))
         
-# blocksize=64
-# compress_statistics = True
-# quant_type = "fp4"
-# quant_storage=torch.uint8
+if __name__ ==  "__main__":
+    # blocksize=64
+    # compress_statistics = True
+    # quant_type = "fp4"
+    # quant_storage=torch.uint8
 
-# w = torch.randn((4,4))
+    w = torch.randn((4,4))
 
-# w_4bit, quant_state = bnb.functional.quantize_4bit(
-#     w.to("cuda"),
-#     blocksize=blocksize,
-#     compress_statistics=compress_statistics,
-#     quant_type=quant_type,
-#     quant_storage=quant_storage,
-#     )
-# print(f"{w_4bit.size()=}")
+    # w_4bit, quant_state = bnb.functional.quantize_4bit(
+    #     w.to("cuda"),
+    #     blocksize=blocksize,
+    #     compress_statistics=compress_statistics,
+    #     quant_type=quant_type,
+    #     quant_storage=quant_storage,
+    #     )
+    # print(f"{w_4bit.size()=}")
 
-# a = DispatchParams4bit(w)
-# a.to("cuda")
+    a = Params4bit(w)
+    a.to("cuda")
 
-# import bitsandbytes.functional as F
-# print(f"{F.dequantize_4bit(a._data, a.quant_state)=}")
+    import bitsandbytes.functional as F
+    print(f"{F.dequantize_4bit(a._data, a.quant_state)=}")
 
-# a_chunks = torch.chunk(a, 2, dim=0)
+    a_chunks = torch.chunk(a, 2, dim=0)
 
-# print(f"{a_chunks=}")
+    print(f"{a_chunks=}")
 
-# print(f"{a.size()=}")
-# print(f"{a_chunks[0].size()=}")
+    print(f"{a.size()=}")
+    print(f"{a_chunks[0].size()=}")
 
 
-# print(f"{F.dequantize_4bit(a_chunks[0]._data, a_chunks[0].quant_state)=}")
-# print(f"{F.dequantize_4bit(a_chunks[1]._data, a_chunks[1].quant_state)=}")
-print(f"{Params4bit.foo=}")
+    print(f"{F.dequantize_4bit(a_chunks[0]._data, a_chunks[0].quant_state)=}")
+    print(f"{F.dequantize_4bit(a_chunks[1]._data, a_chunks[1].quant_state)=}")
