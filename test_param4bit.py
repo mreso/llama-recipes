@@ -11,6 +11,7 @@ from typing import Optional, Dict, Any, Union, overload, TypeVar
 T = TypeVar("T", bound="torch.nn.Module")
 
 class Params4bit(torch.nn.Parameter):
+    foo = "bar"
     def __new__(
         cls,
         data: Optional[torch.Tensor] = None,
@@ -22,6 +23,7 @@ class Params4bit(torch.nn.Parameter):
         quant_storage: torch.dtype = torch.uint8,
         module: Optional["Linear4bit"] = None,
         bnb_quantized: bool = False,
+        _data: Optional[torch.Tensor] = None,
     ) -> "Params4bit":
         if data is None:
             data = torch.empty(0)
@@ -33,7 +35,7 @@ class Params4bit(torch.nn.Parameter):
         self.quant_state = quant_state
         self.quant_storage = quant_storage
         self.bnb_quantized = bnb_quantized
-        self._data = data
+        self._data = data if _data is None else _data
         self.module = module
         return self
 
@@ -95,6 +97,8 @@ class Params4bit(torch.nn.Parameter):
         return self
 
     def _quantize(self, device):
+        # if self._data.device.type == "meta":
+        #     self._data = torch.empty_like(self._data, device=device)
         w = self._data.contiguous().to(device)
         w_4bit, quant_state = bnb.functional.quantize_4bit(
             w,
@@ -132,6 +136,8 @@ class Params4bit(torch.nn.Parameter):
 
         if device is not None and device.type == "cuda" and not self.bnb_quantized:
             return self._quantize(device)
+        # elif device is not None and device.type == "meta":
+        #     return self._data
         else:
             if self.quant_state is not None:
                 self.quant_state.to(device)
@@ -147,6 +153,30 @@ class Params4bit(torch.nn.Parameter):
             )
 
             return new_param
+
+    __torch_function__ = torch._C._disabled_torch_function_impl
+
+    def __repr__(self):
+        return f"{self.__class__} (Data={self._data}"
+
+    @classmethod
+    def __torch_dispatch__(cls, func, types, args=(), kwargs=None):
+        if func == torch.ops.aten.split.Tensor:
+            return params4bit_chunk(func, *args, **kwargs)
+
+        def unwrap(t):
+            if isinstance(t, cls):
+                return t._data
+            else:
+                return t
+
+        def wrap(t):
+            if isinstance(t, Tensor) and not isinstance(t, cls):
+                return cls(t)
+            else:
+                return t
+
+        return tree_map(wrap, func(*tree_map(unwrap, args), **tree_map(unwrap, kwargs)))
 
 
 def params4bit_chunk(aten_op, *args, **kwargs):
@@ -195,60 +225,61 @@ def params4bit_chunk(aten_op, *args, **kwargs):
     return params4bit_chunks
 
 
-class DispatchParams4bit(Params4bit):
-    __torch_function__ = torch._C._disabled_torch_function_impl
+# class DispatchParams4bit(Params4bit):
+#     __torch_function__ = torch._C._disabled_torch_function_impl
 
-    def __repr__(self):
-        return f"{self.__class__} (Data={self._data}"
+#     def __repr__(self):
+#         return f"{self.__class__} (Data={self._data}"
 
-    @classmethod
-    def __torch_dispatch__(cls, func, types, args=(), kwargs=None):
-        if func == torch.ops.aten.split.Tensor:
-            return params4bit_chunk(func, *args, **kwargs)
+#     @classmethod
+#     def __torch_dispatch__(cls, func, types, args=(), kwargs=None):
+#         if func == torch.ops.aten.split.Tensor:
+#             return params4bit_chunk(func, *args, **kwargs)
 
-        def unwrap(t):
-            if isinstance(t, cls):
-                return t._data
-            else:
-                return t
+#         def unwrap(t):
+#             if isinstance(t, cls):
+#                 return t._data
+#             else:
+#                 return t
 
-        def wrap(t):
-            if isinstance(t, Tensor) and not isinstance(t, cls):
-                return cls(t)
-            else:
-                return t
+#         def wrap(t):
+#             if isinstance(t, Tensor) and not isinstance(t, cls):
+#                 return cls(t)
+#             else:
+#                 return t
 
-        return tree_map(wrap, func(*tree_map(unwrap, args), **tree_map(unwrap, kwargs)))
+#         return tree_map(wrap, func(*tree_map(unwrap, args), **tree_map(unwrap, kwargs)))
         
-blocksize=64
-compress_statistics = True
-quant_type = "fp4"
-quant_storage=torch.uint8
+# blocksize=64
+# compress_statistics = True
+# quant_type = "fp4"
+# quant_storage=torch.uint8
 
-w = torch.randn((4,4))
+# w = torch.randn((4,4))
 
-w_4bit, quant_state = bnb.functional.quantize_4bit(
-    w.to("cuda"),
-    blocksize=blocksize,
-    compress_statistics=compress_statistics,
-    quant_type=quant_type,
-    quant_storage=quant_storage,
-    )
-print(f"{w_4bit.size()=}")
+# w_4bit, quant_state = bnb.functional.quantize_4bit(
+#     w.to("cuda"),
+#     blocksize=blocksize,
+#     compress_statistics=compress_statistics,
+#     quant_type=quant_type,
+#     quant_storage=quant_storage,
+#     )
+# print(f"{w_4bit.size()=}")
 
-a = DispatchParams4bit(w)
-a.to("cuda")
+# a = DispatchParams4bit(w)
+# a.to("cuda")
 
-import bitsandbytes.functional as F
-print(f"{F.dequantize_4bit(a._data, a.quant_state)=}")
+# import bitsandbytes.functional as F
+# print(f"{F.dequantize_4bit(a._data, a.quant_state)=}")
 
-a_chunks = torch.chunk(a, 2, dim=0)
+# a_chunks = torch.chunk(a, 2, dim=0)
 
-print(f"{a_chunks=}")
+# print(f"{a_chunks=}")
 
-print(f"{a.size()=}")
-print(f"{a_chunks[0].size()=}")
+# print(f"{a.size()=}")
+# print(f"{a_chunks[0].size()=}")
 
 
-print(f"{F.dequantize_4bit(a_chunks[0]._data, a_chunks[0].quant_state)=}")
-print(f"{F.dequantize_4bit(a_chunks[1]._data, a_chunks[1].quant_state)=}")
+# print(f"{F.dequantize_4bit(a_chunks[0]._data, a_chunks[0].quant_state)=}")
+# print(f"{F.dequantize_4bit(a_chunks[1]._data, a_chunks[1].quant_state)=}")
+print(f"{Params4bit.foo=}")
