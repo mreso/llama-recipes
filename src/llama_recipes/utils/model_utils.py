@@ -35,7 +35,9 @@ def print_model_size(model: nn.Module, config: TrainConfig, rank: int = 0) -> No
 
 
 def get_model_and_data_processor(
-    train_config: TrainConfig, quant_config: QuantizationConfig
+    train_config: TrainConfig,
+    quant_config: QuantizationConfig,
+    
 ):
     bnb_config = None
     if quant_config:
