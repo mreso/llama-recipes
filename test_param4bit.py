@@ -27,15 +27,13 @@ class Params4bit(torch.nn.Parameter):
         module: Optional["Linear4bit"] = None,
         bnb_quantized: bool = False,
         _data: Optional[torch.Tensor] = None,
-        original_size: Optional[torch.Size] = None,
     ) -> "Params4bit":
-        new_data = data if _data is None else _data
+        new_data = _data if data is None else data
+        
         if new_data is None:
             new_data = torch.empty(0)
-        if original_size is not None:
-            size = original_size
-        else:
-            size = quant_state.shape if quant_state is not None else new_data.size()
+            
+        size = new_data.size()
         self = torch.Tensor._make_wrapper_subclass(cls, size, dtype=quant_storage, requires_grad=requires_grad, device=new_data.device)
         return self
 
@@ -51,7 +49,6 @@ class Params4bit(torch.nn.Parameter):
         module: Optional["Linear4bit"] = None,
         bnb_quantized: bool = False,
         _data: Optional[torch.Tensor] = None,
-        original_size: Optional[torch.Size] = None,
     ) -> "Params4bit":
         self.blocksize = blocksize
         self.compress_statistics = compress_statistics
@@ -59,8 +56,12 @@ class Params4bit(torch.nn.Parameter):
         self.quant_state = quant_state
         self.quant_storage = quant_storage
         self.bnb_quantized = bnb_quantized
-        self._data = data if _data is None else _data
+        self._data = _data if data is None else data
+        if isinstance(self._data, Params4bit):
+            self._data = self._data._data
         self.module = module
+        assert (quant_state is not None) == bnb_quantized, f"{quant_state=} {bnb_quantized=}"
+
 
     def __getstate__(self):
         state = self.__dict__.copy()
@@ -93,6 +94,10 @@ class Params4bit(torch.nn.Parameter):
         new_instance.__setstate__(state)
         return new_instance
 
+    @property
+    def data(self):
+        return self._data.data
+
     @classmethod
     def from_prequantized(
         cls,
@@ -104,6 +109,7 @@ class Params4bit(torch.nn.Parameter):
         **kwargs,
     ) -> "Params4bit":
         quant_state = QuantState.from_dict(qs_dict=quantized_stats, device=device)
+        print(f"from_prequantized: {quant_state.shape=}")
         self = Params4bit(
             data,
             requires_grad = requires_grad,
@@ -127,10 +133,7 @@ class Params4bit(torch.nn.Parameter):
         dtype,
         non_blocking,
         ):
-        if self._data.device.type == "meta":
-            w = torch.empty_like(self._data, device=device)
-        else:
-            w = self._data.contiguous().to(device)
+        w = self._data.contiguous().to(device)
 
         w_4bit, quant_state = bnb.functional.quantize_4bit(
             w,
@@ -145,17 +148,7 @@ class Params4bit(torch.nn.Parameter):
             self.module.quant_state = quant_state
         self.bnb_quantized = True
 
-        new_param = Params4bit(
-                self._data.to(device=device, dtype=dtype, non_blocking=non_blocking),
-                requires_grad=self.requires_grad,
-                quant_state=self.quant_state,
-                blocksize=self.blocksize,
-                compress_statistics=self.compress_statistics,
-                quant_type=self.quant_type,
-                quant_storage=self.quant_storage,
-            )
-
-        return new_param
+        return self
 
     def cuda(self, device: Optional[Union[int, device, str]] = None, non_blocking: bool = False):
         return self.to(device="cuda" if device is None else device, non_blocking=non_blocking)
@@ -179,12 +172,10 @@ class Params4bit(torch.nn.Parameter):
 
         if device is not None and device.type == "cuda" and not self.bnb_quantized:
             return self._quantize(device, dtype, non_blocking)
-        # elif device is not None and device.type == "meta":
-        #     return self._data
         else:
             if self.quant_state is not None:
                 self.quant_state.to(device)
-
+            
             new_param = Params4bit(
                 self._data.to(device=device, dtype=dtype, non_blocking=non_blocking),
                 requires_grad=self.requires_grad,
@@ -193,6 +184,8 @@ class Params4bit(torch.nn.Parameter):
                 compress_statistics=self.compress_statistics,
                 quant_type=self.quant_type,
                 quant_storage=self.quant_storage,
+                #TODO: Find out why this it not set in original code
+                bnb_quantized=self.bnb_quantized,
             )
 
             return new_param
@@ -215,6 +208,8 @@ class Params4bit(torch.nn.Parameter):
             return params4bit_slice(func, args, kwargs)
         elif func == torch.ops.aten.new_zeros.default:
             return params4bit_new_zeros(func, args, kwargs)
+        elif func == torch.ops.aten.t.default:
+            return params4bit_t(func, args, kwargs)
 
         def unwrap(t):
             if isinstance(t, cls):
@@ -235,6 +230,24 @@ class Params4bit(torch.nn.Parameter):
             raise e
 
 # params4bit_* are adapted from https://github.com/pytorch/ao/blob/abff563ba515576fc48cd4ac0feb923dd65dc267/torchao/dtypes/nf4tensor.py
+def params4bit_t(aten_op, args, kwargs=None):
+    params4bit = args[0]
+    from copy import deepcopy
+    new_quant_state = deepcopy(params4bit.quant_state)
+    new_quant_state.shape = torch.Size((new_quant_state.shape[1], new_quant_state.shape[0]))
+    return Params4bit(
+        params4bit._data.t(),
+        quant_state = new_quant_state,
+        blocksize = params4bit.blocksize,
+        compress_statistics = params4bit.compress_statistics,
+        quant_type = params4bit.quant_type,
+        quant_storage = params4bit.quant_storage,
+        bnb_quantized = params4bit.bnb_quantized,
+        module = params4bit.module,
+        # original_size = new_size,
+    )
+
+
 def params4bit_new_zeros(aten_op, args, kwargs=None):
     params4bit = args[0]
     new_size = tuple(args[1])
@@ -262,7 +275,7 @@ def params4bit_new_zeros(aten_op, args, kwargs=None):
         quant_storage = params4bit.quant_storage,
         bnb_quantized = params4bit.bnb_quantized,
         module = params4bit.module,
-        original_size = new_size,
+        # original_size = new_size,
     )
 
 def params4bit_slice(aten_op, *args, **kwargs):
@@ -281,7 +294,7 @@ def params4bit_slice(aten_op, *args, **kwargs):
         quant_storage = params4bit.quant_storage,
         bnb_quantized = params4bit.bnb_quantized,
         module = params4bit.module,
-        original_size = params4bit.size(),
+        # original_size = params4bit.size(),
     )
 
 
@@ -296,6 +309,7 @@ def params4bit_detach(aten_op, *args, **kwargs):
         quant_storage = params4bit.quant_storage,
         bnb_quantized = params4bit.bnb_quantized,
         module = params4bit.module,
+        # original_size = params4bit.size(),
     )
     
 
@@ -358,7 +372,7 @@ def params4bit_chunk(aten_op, *args, **kwargs):
             "quant_storage": params4bit.quant_storage,
             "bnb_quantized": params4bit.bnb_quantized,
             "module": params4bit.module,
-            "original_size": new_orig_size,
+            # "original_size": new_orig_size,
         }
         params4bit_chunks.append(Params4bit(attr_to_chunks["_data"][idx], params4bit.requires_grad, **params4bit_args))
 
