@@ -1,14 +1,17 @@
+import copy
 import sys
 import torch
 import torch.nn as nn
 from dataclasses import dataclass
 from torch.utils._pytree import tree_map, tree_map_only
 from torch import Tensor, device, dtype
+import torch.distributed as dist
+from torch.distributed.device_mesh import DeviceMesh
 
 import bitsandbytes as bnb
 # from bitsandbytes.nn import Linear4bit, Params4bit
 from bitsandbytes.functional import QuantState
-from typing import Optional, Dict, Any, Union, overload, TypeVar
+from typing import Optional, Dict, Any, Union, overload, TypeVar, Tuple
 
 T = TypeVar("T", bound="torch.nn.Module")
 
@@ -29,6 +32,8 @@ class Params4bit(torch.nn.Parameter):
         _data: Optional[torch.Tensor] = None,
     ) -> "Params4bit":
         new_data = _data if data is None else data
+
+        assert quant_state is not None or new_data.shape[1]!= 1, (f"{quant_state=} {new_data.shape=}")
         
         if new_data is None:
             new_data = torch.empty(0)
@@ -60,7 +65,7 @@ class Params4bit(torch.nn.Parameter):
         if isinstance(self._data, Params4bit):
             self._data = self._data._data
         self.module = module
-        assert (quant_state is not None) == bnb_quantized, f"{quant_state=} {bnb_quantized=}"
+        # assert (quant_state is not None) == bnb_quantized, f"{quant_state=} {bnb_quantized=}"
 
 
     def __getstate__(self):
@@ -193,11 +198,14 @@ class Params4bit(torch.nn.Parameter):
     __torch_function__ = torch._C._disabled_torch_function_impl
 
     def __repr__(self):
-        return f"{self.__class__} (Data={self._data}"
+        quant_state = None if self.quant_state is None else self.quant_state.as_dict(packed=False)
+        return f"{self.__class__} (Data={self._data} {self._data.shape=} {quant_state=} {self.bnb_quantized=})"
 
     @classmethod
     def __torch_dispatch__(cls, func, types, args=(), kwargs=None):
         #TODO: add @implements decorator 
+        if dist.get_rank() == 0:
+            print(f"{func=}")
         if func == torch.ops.aten.split.Tensor:
             return params4bit_chunk(func, args, kwargs)
         elif func == torch.ops.aten.copy_.default:
@@ -210,6 +218,15 @@ class Params4bit(torch.nn.Parameter):
             return params4bit_new_zeros(func, args, kwargs)
         elif func == torch.ops.aten.t.default:
             return params4bit_t(func, args, kwargs)
+        elif func == torch.ops.aten.view.default:
+            return params4bit_view(func, args, kwargs)
+        elif func == torch.ops.aten.as_strided.default:
+            return params4bit_as_strided(func, args, kwargs)
+        elif func == torch.ops._c10d_functional.all_gather_into_tensor.default:
+            return params4bit_all_gather_into_tensor(func, args, kwargs)
+        elif func == torch.ops._c10d_functional.wait_tensor.default:
+            return params4bit_wait_tensor(func, args, kwargs)
+
 
         def unwrap(t):
             if isinstance(t, cls):
@@ -222,18 +239,171 @@ class Params4bit(torch.nn.Parameter):
                 return cls(t)
             else:
                 return t
-        print(f"{func=}")
         try:
             return tree_map(wrap, func(*tree_map(unwrap, args), **tree_map(unwrap, kwargs)))
         except RuntimeError as e:
             print(f"{func=}")
             raise e
 
+    def fsdp_pre_all_gather(
+        self, mesh: DeviceMesh
+    ) -> Tuple[Tuple[torch.Tensor, ...], Any]:
+        if dist.get_rank() == 0:
+            print(f"fsdp_pre_all_gather")
+        return (
+            (self._data,),
+            (
+                self.quant_state.as_dict(packed=True),
+                self.blocksize,
+                self.compress_statistics,
+                self.quant_type,
+                self.quant_storage,
+                self.bnb_quantized,
+                self.module,
+            ),
+        )
+
+    def fsdp_post_all_gather(
+        self,
+        all_gather_outputs: Tuple[torch.Tensor, ...],
+        metadata: Any,
+        param_dtype: torch.dtype,
+        *,
+        out: Optional[torch.Tensor] = None,
+    ) -> Union[Tuple[torch.Tensor, Tuple[torch.Tensor, ...]], None]:
+        if dist.get_rank() == 0:
+            print(f"fsdp_post_all_gather")
+        (_data,) = all_gather_outputs
+        (
+            quant_state,
+            blocksize,
+            compress_statistics,
+            quant_type,
+            quant_storage,
+            bnb_quantized,
+            module,
+            ) = metadata
+
+        new_p = Params4bit(
+            _data,
+            quant_state = QuantState.from_dict(quant_state, device=_data.device),
+            blocksize = blocksize,
+            compress_statistics = compress_statistics,
+            quant_type = quant_type,
+            quant_storage = quant_storage,
+            bnb_quantized = bnb_quantized,
+            module = module,
+        )
+        return new_p, (_data,)
+
+
 # params4bit_* are adapted from https://github.com/pytorch/ao/blob/abff563ba515576fc48cd4ac0feb923dd65dc267/torchao/dtypes/nf4tensor.py
+
+def params4bit_wait_tensor(aten_op, args, kwargs=None):
+    params4bit = args[0]
+
+    new_data = aten_op(params4bit._data, *args[1:], **kwargs)
+    new_quant_state = copy.copy(params4bit.quant_state)
+
+    return Params4bit(
+        new_data,
+        quant_state = new_quant_state,
+        blocksize = params4bit.blocksize,
+        compress_statistics = params4bit.compress_statistics,
+        quant_type = params4bit.quant_type,
+        quant_storage = params4bit.quant_storage,
+        bnb_quantized = params4bit.bnb_quantized,
+        module = params4bit.module,
+    )
+
+def params4bit_all_gather_into_tensor(aten_op, args, kwargs=None):
+    params4bit = args[0]
+    new_data = aten_op(params4bit._data, *args[1:], **kwargs)
+
+    ratio = new_data.shape[0] // params4bit._data.shape[0]
+
+    new_quant_state = copy.copy(params4bit.quant_state)
+    new_quant_state.shape = torch.Size((new_quant_state.shape[0] * ratio, new_quant_state.shape[1]))
+    return Params4bit(
+        new_data,
+        quant_state = new_quant_state,
+        blocksize = params4bit.blocksize,
+        compress_statistics = params4bit.compress_statistics,
+        quant_type = params4bit.quant_type,
+        quant_storage = params4bit.quant_storage,
+        bnb_quantized = params4bit.bnb_quantized,
+        module = params4bit.module,
+    )
+    
+
+def params4bit_as_strided(aten_op, args, kwargs=None):
+    params4bit = args[0]
+    size = args[1]
+    stride = tuple(args[2])
+    storage_offset = args[3]
+    
+
+    import math
+    from torch._prims_common import make_contiguous_strides_for
+    if math.prod(size) != params4bit.numel():
+        raise NotImplementedError(
+            f"params4bit_as_strided different numel={params4bit.numel()} and size={size}"
+        )
+    if stride != make_contiguous_strides_for(size):
+        raise NotImplementedError(
+            f"params4bit_as_strided only support continuous stride={make_contiguous_strides_for(size)} but got stride={stride}"
+        )
+    if params4bit.storage_offset() != storage_offset:
+        raise NotImplementedError(
+            f"params4bit_as_strided only support original storage offset {params4bit.storage_offset()} but got {storage_offset}"
+        )
+    # kwargs = {
+    #     "size": torch.Size(size),
+    #     "stride": stride,
+    #     "storage_offset": storage_offset,
+    # }
+    new_data = aten_op(params4bit._data, *args[1:], **kwargs)
+    return Params4bit(
+        new_data,
+        quant_state = params4bit.quant_state,
+        blocksize = params4bit.blocksize,
+        compress_statistics = params4bit.compress_statistics,
+        quant_type = params4bit.quant_type,
+        quant_storage = params4bit.quant_storage,
+        bnb_quantized = params4bit.bnb_quantized,
+        module = params4bit.module,
+    )
+
+def params4bit_view(aten_op, args, kwargs=None):
+    params4bit = args[0]
+    size = args[1]
+    if size[0] != -1 and size[0] != params4bit._data.shape[0]:
+        raise NotImplementedError(f"aten.view(Params4bit) with size={size} {params4bit.quant_state.shape=}")
+
+    # updated_attrs = apply_to_inner_tensors(nf4tensor, aten_op, args[1:], kwargs)
+    # updated_attrs.update(
+    #     {
+    #         "size": [nf4tensor.numel()],
+    #         "stride": (1,),
+    #     }
+    # )
+    # return NF4Tensor(*construct_nf4_args(nf4tensor, updated_attrs))
+    new_data = aten_op(params4bit._data, size, **kwargs)
+    return Params4bit(
+        new_data,
+        quant_state = params4bit.quant_state,
+        blocksize = params4bit.blocksize,
+        compress_statistics = params4bit.compress_statistics,
+        quant_type = params4bit.quant_type,
+        quant_storage = params4bit.quant_storage,
+        bnb_quantized = params4bit.bnb_quantized,
+        module = params4bit.module,
+    )
+
+
 def params4bit_t(aten_op, args, kwargs=None):
     params4bit = args[0]
-    from copy import deepcopy
-    new_quant_state = deepcopy(params4bit.quant_state)
+    new_quant_state = copy.deepcopy(params4bit.quant_state)
     new_quant_state.shape = torch.Size((new_quant_state.shape[1], new_quant_state.shape[0]))
     return Params4bit(
         params4bit._data.t(),
@@ -244,7 +414,6 @@ def params4bit_t(aten_op, args, kwargs=None):
         quant_storage = params4bit.quant_storage,
         bnb_quantized = params4bit.bnb_quantized,
         module = params4bit.module,
-        # original_size = new_size,
     )
 
 
@@ -255,27 +424,23 @@ def params4bit_new_zeros(aten_op, args, kwargs=None):
 
     import math
     ratio = params4bit.numel() // math.prod(new_size)
-    print(f"{params4bit.numel()=}")
-    print(f"{new_size=}")
-    print(f"{ratio=}")
-    print(f"{params4bit._data.size()=}")
 
     assert (
             params4bit._data.size(0) % ratio == 0
         ), f"params4bit_data.numel() must be divisible by {ratio}"
 
     new_data = aten_op(params4bit._data, [params4bit._data.size(0) // ratio, 1], **kwargs)
-    print(f"{new_data.size()=}")
+    new_quant_state = copy.copy(params4bit.quant_state)
+    new_quant_state.shape = torch.Size((new_quant_state.shape[0] // ratio, new_quant_state.shape[1]))
     return Params4bit(
         new_data,
-        quant_state = params4bit.quant_state,
+        quant_state = new_quant_state,
         blocksize = params4bit.blocksize,
         compress_statistics = params4bit.compress_statistics,
         quant_type = params4bit.quant_type,
         quant_storage = params4bit.quant_storage,
         bnb_quantized = params4bit.bnb_quantized,
         module = params4bit.module,
-        # original_size = new_size,
     )
 
 def params4bit_slice(aten_op, *args, **kwargs):
@@ -285,6 +450,7 @@ def params4bit_slice(aten_op, *args, **kwargs):
     # aten.slice(dim = 0, end=sys.maxsize)
     if args[0][3] not in [params4bit.size(0), sys.maxsize]:
         raise NotImplementedError(f"aten.slice(Params4bit) with end={args[0][3]}")
+    new_data = aten_op(params4bit._data, *args[0][1:], **kwargs)
     return Params4bit(
         params4bit._data,
         quant_state = params4bit.quant_state,
@@ -294,14 +460,14 @@ def params4bit_slice(aten_op, *args, **kwargs):
         quant_storage = params4bit.quant_storage,
         bnb_quantized = params4bit.bnb_quantized,
         module = params4bit.module,
-        # original_size = params4bit.size(),
     )
 
 
 def params4bit_detach(aten_op, *args, **kwargs):
     params4bit = args[0][0]
+    new_data = aten_op(params4bit._data, *args[0][1:], **kwargs)
     return Params4bit(
-        params4bit._data.detach(),
+        new_data,
         quant_state = params4bit.quant_state,
         blocksize = params4bit.blocksize,
         compress_statistics = params4bit.compress_statistics,
@@ -309,7 +475,6 @@ def params4bit_detach(aten_op, *args, **kwargs):
         quant_storage = params4bit.quant_storage,
         bnb_quantized = params4bit.bnb_quantized,
         module = params4bit.module,
-        # original_size = params4bit.size(),
     )
     
 
@@ -319,11 +484,9 @@ def params4bit_copy(aten_op, *args, **kwargs):
 
     # Same meta data
     if original.quant_state == copy_to.quant_state:
-        print(f"{original._data.size()=}")
-        print(f"{copy_to._data.size()=}")
         original._data.copy_(copy_to._data)
         return
-    
+
     raise NotImplementedError(f"Copy from {original.quant_state=} to {copy_to.quant_state=}")
 
 def params4bit_chunk(aten_op, *args, **kwargs):
@@ -340,9 +503,6 @@ def params4bit_chunk(aten_op, *args, **kwargs):
     assert params4bit._data.numel() % num_chunks == 0, f"{params4bit._data.shape=}, {num_chunks=}"
 
     chunk_size = params4bit._data.shape[0] // num_chunks
-    print(f"{num_chunks=}")
-    print(f"{orig_chunk_size=}")
-    print(f"{chunk_size=}")
 
 
     attr_to_chunks["_data"] = aten_op(params4bit._data, chunk_size, *args, **kwargs)
@@ -359,10 +519,8 @@ def params4bit_chunk(aten_op, *args, **kwargs):
     new_orig_size = torch.Size((params4bit.size(0) // num_chunks, params4bit.size(1)))
     
     params4bit_chunks = []
-    quant_state = params4bit.quant_state
+    quant_state = copy.copy(params4bit.quant_state)
     quant_state.shape = torch.Size(chunked_size)
-    print(f"{chunked_size=}")
-    print(f"{quant_state.shape=}")
     for idx in range(num_chunks):
         params4bit_args = {
             "blocksize": params4bit.blocksize,
@@ -372,9 +530,9 @@ def params4bit_chunk(aten_op, *args, **kwargs):
             "quant_storage": params4bit.quant_storage,
             "bnb_quantized": params4bit.bnb_quantized,
             "module": params4bit.module,
-            # "original_size": new_orig_size,
+            "requires_grad":params4bit.requires_grad,
         }
-        params4bit_chunks.append(Params4bit(attr_to_chunks["_data"][idx], params4bit.requires_grad, **params4bit_args))
+        params4bit_chunks.append(Params4bit(attr_to_chunks["_data"][idx], **params4bit_args))
 
     return params4bit_chunks
 
